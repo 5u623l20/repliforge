@@ -1,0 +1,804 @@
+#!/bin/sh
+
+# shellcheck disable=SC3043
+
+# Creates a temporary directory and prints the name to standard output.
+# shellcheck disable=SC2120
+mktemp_directory() {
+	need_cmd mktemp
+
+	if [ -n "${1:-}" ]; then
+		mktemp -d "$1/tmp.XXXXXX"
+	else
+		mktemp -d 2>/dev/null || mktemp -d -t tmp
+	fi
+}
+
+# Creates a temporary file and prints the name to standard output.
+# shellcheck disable=SC2120
+mktemp_file() {
+	need_cmd mktemp
+
+	if [ -n "${1:-}" ]; then
+		mktemp "$1/tmp.XXXXXX"
+	else
+		mktemp 2>/dev/null || mktemp -t tmp
+	fi
+}
+
+# Removes any tracked files registered via [`cleanup_file`].
+trap_cleanup_files() {
+	set +e
+
+	if [ -n "${__CLEANUP_FILES__:-}" ] && [ -f "$__CLEANUP_FILES__" ]; then
+		local _file
+		while read -r _file; do
+			rm -f "$_file"
+		done <"$__CLEANUP_FILES__"
+		unset _file
+		rm -f "$__CLEANUP_FILES__"
+	fi
+}
+
+# Prints an error message and exits with a non-zero code if the program is not
+# available on the system PATH.
+need_cmd() {
+	if ! check_cmd "$1"; then
+		e_die "Required command '$1' not found on PATH"
+	fi
+}
+
+# Removes any tracked files and directories registered via [`cleanup_file`]
+# and [`cleanup_directory`] respectively.
+trap_cleanups() {
+	set +e
+
+	trap_cleanup_directories
+	trap_cleanup_files
+}
+
+# Prints a warning message to standard out.
+e_warn() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\033[1;31;40m!!! \033[1;37;40m%s\033[0m\n" "$1"
+			;;
+		*)
+			printf -- "!!! %s\n" "$1"
+			;;
+	esac
+}
+
+# Prints a section-delimiting header to standard out.
+e_header() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\033[1;36;40m--- \033[1;37;40m%s\033[0m\n" "$1"
+			;;
+		*)
+			printf -- "--- %s\n" "$1"
+			;;
+	esac
+}
+
+# Sets up state to track directories for later cleanup in a trap handler.
+setup_cleanup_directories() {
+	if [ "${__CLEANUP_DIRECTORIES_SETUP__:-}" != "$$" ]; then
+		unset __CLEANUP_DIRECTORIES__
+		__CLEANUP_DIRECTORIES_SETUP__="$$"
+		export __CLEANUP_DIRECTORIES_SETUP__
+	fi
+
+	# If a tempfile hasn't been setup yet, create it
+	if [ -z "${__CLEANUP_DIRECTORIES__:-}" ]; then
+		__CLEANUP_DIRECTORIES__="$(mktemp_file)"
+
+		# If the result string is empty, tempfile wasn't created so report failure
+		if [ -z "$__CLEANUP_DIRECTORIES__" ]; then
+			return 1
+		fi
+
+		export __CLEANUP_DIRECTORIES__
+	fi
+}
+
+# Sets up state to track files for later cleanup in a trap handler.
+setup_cleanup_files() {
+	if [ "${__CLEANUP_FILES_SETUP__:-}" != "$$" ]; then
+		unset __CLEANUP_FILES__
+		__CLEANUP_FILES_SETUP__="$$"
+		export __CLEANUP_FILES_SETUP__
+	fi
+
+	# If a tempfile hasn't been setup yet, create it
+	if [ -z "${__CLEANUP_FILES__:-}" ]; then
+		__CLEANUP_FILES__="$(mktemp_file)"
+
+		# If the result string is empty, tempfile wasn't created so report failure
+		if [ -z "$__CLEANUP_FILES__" ]; then
+			return 1
+		fi
+
+		export __CLEANUP_FILES__
+	fi
+}
+
+# Sets up state to track files and directories for later cleanup in a trap
+# handler.
+setup_cleanups() {
+	setup_cleanup_directories
+	setup_cleanup_files
+}
+
+# Sets up traps for `EXIT` and common signals with the given cleanup function.
+setup_traps() {
+	local _sig
+	for _sig in HUP INT QUIT ALRM TERM; do
+		trap "
+		$1
+		trap - $_sig EXIT
+		kill -s $_sig "'"$$"' "$_sig"
+	done
+
+	# shellcheck disable=SC2064
+	trap "$1" EXIT
+
+	unset _sig
+}
+
+# Removes any tracked directories registered via [`cleanup_directory`].
+trap_cleanup_directories() {
+	set +e
+
+	if [ -n "${__CLEANUP_DIRECTORIES__:-}" ] && [ -f "$__CLEANUP_DIRECTORIES__" ]; then
+		local _dir
+		while read -r _dir; do
+			rm -rf "$_dir"
+		done <"$__CLEANUP_DIRECTORIES__"
+		unset _dir
+		rm -f "$__CLEANUP_DIRECTORIES__"
+	fi
+}
+
+# Determines whether or not a program is available on the system PATH.
+check_cmd() {
+	if ! command -v "$1" >/dev/null 2>&1; then
+		return 1
+	fi
+}
+
+# Tracks a directory for later cleanup in a trap handler.
+cleanup_directory() {
+	setup_cleanup_directories
+	echo "$1" >>"$__CLEANUP_DIRECTORIES__"
+}
+
+# Tracks a file for later cleanup in a trap handler.
+cleanup_file() {
+	setup_cleanup_files
+	echo "$1" >>"$__CLEANUP_FILES__"
+}
+
+# Prints an error message to standard error and exits with a non-zero exit
+# code.
+e_die() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\n\033[1;31;40mxxx \033[1;37;40m%s\033[0m\n\n" "$1" >&2
+			;;
+		*)
+			printf -- "\nxxx %s\n\n" "$1" >&2
+			;;
+	esac
+
+	exit 1
+}
+
+# Downloads the contents at the given URL to the given local file.
+download() {
+	local _url _dst _code _orig_flags
+	_url="$1"
+	_dst="$2"
+
+	need_cmd sed
+
+	# Attempt to download with fetch, if found. If successful, quick return
+	if check_cmd fetch; then
+		info "Downloading $_url to $_dst (fetch)"
+		_orig_flags="$-"
+		set +e
+		fetch -qR "$_url" -o "$_dst"
+		_code="$?"
+		set "-$(echo "$_orig_flags" | sed s/s//g)"
+		if [ $_code -eq 0 ]; then
+			unset _url _dst _code _orig_flags
+			return 0
+		else
+			local _e
+			_e="fetch failed to download file, perhaps fetch doesn't have"
+			_e="$_e SSL support and/or no CA certificates are present?"
+			e_warn "$_e"
+			unset _e
+		fi
+	fi
+
+	unset _url _dst _code _orig_flags
+	return 1
+}
+
+# Prints an informational, detailed step to standard out.
+info() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\033[1;36;40m  - \033[1;37;40m%s\033[0m\n" "$1"
+			;;
+		*)
+			printf -- "  - %s\n" "$1"
+			;;
+	esac
+}
+
+# Completes printing an informational, detailed step to standard out which has
+# no output, started with `e_info_start`
+e_info_end() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\033[1;36;40m✔✔✔ \033[1;37;40m%s\033[0m\n" "DONE."
+			;;
+		*)
+			printf -- "%s\n" "done."
+			;;
+	esac
+}
+
+# Prints an informational, detailed step to standard out which has no output.
+e_info_start() {
+	case "${TERM:-}" in
+		*term | alacritty | rxvt | screen | screen-* | tmux | tmux-* | xterm-*)
+			printf -- "\033[1;36;40m  - \033[1;37;40m%s ... \033[0m\n" "$1"
+			;;
+		*)
+			printf -- "  - %s ... " "$1"
+			;;
+	esac
+}
+
+if check_cmd aws; then
+	_AWS_BIN=$(command -v aws)
+fi
+if check_cmd git; then
+	_GIT_BIN=$(command -v git)
+fi
+if check_cmd mkdir; then
+	_MKDIR="mkdir -p"
+fi
+if check_cmd strings; then
+	_STRINGS_BIN=$(command -v strings)
+fi
+if check_cmd date; then
+	TODAY=$(date -u +%Y-%m-%d)
+fi
+
+_AWS_PKG=$(pkg search -q -x -q -x '^py3[0-9]+-awscli')
+_BUCKET_CREATED=false
+_GIT_PKG=$(pkg search -q -x -q -x ^git-lite)
+_LOCAL_COMPRESSED_FILE_NAME="$(mktemp_file)"
+_GIT_BRANCH=""
+_GIT_HASH=""
+_GIT_URL="https://git.freebsd.org/src.git"
+_GIT_REPODIR=$(mktemp_directory)
+cleanup_directory "${_GIT_REPODIR}"
+_HASH_IMAGE=$(mktemp_file)
+cleanup_file "${_HASH_IMAGE}"
+_HASH_OBJDIR=$(mktemp_file)
+cleanup_file "${_HASH_OBJDIR}"
+cleanup_file "${_LOCAL_COMPRESSED_FILE_NAME}"
+_LOCAL_IMG_FILE_NAME="$(mktemp_file)"
+cleanup_file "${_LOCAL_IMG_FILE_NAME}"
+_LOCAL_MOUNT_POINT="$(mktemp_directory)"
+cleanup_directory "${_LOCAL_MOUNT_POINT}"
+_OBJDIR=$(mktemp_directory)
+cleanup_directory "${_OBJDIR}"
+_RESULT_DIR="$HOME/repliforge-results"
+_S3_BUCKET="freebsd-$(openssl rand -base64 10 | tr -dc a-z0-9 | head -c 10)"
+_SORT_BIN="/usr/bin/sort -u"
+_ZROOTALT_NAME="zroot-$(openssl rand -base64 10 | tr -dc a-z0-9 | head -c 10)"
+_ZROOT_NAME="zroot"
+
+usage() {
+	cat << EOF
+repliforge is a script to check FreeBSD image reproducibility issues
+
+Usage:
+  repliforge [args] [TARGET]
+
+Available Commands:
+  -t|--type                    Type of image but currently accepts only aws, local and remote
+  -i|--image                   Image ID. For AWS AMI ID. For local image path. For remote image URL
+  -b|--branch                  Git branch from which the build should be attempted
+  -h|--hash                    Git hash from which the build should be attempted
+  -a|--arch                    Machine architecture which are limited to amd64, arm, arm64, i386, powerpc, riscv
+  -p|--platform                Machine platform which are limited to amd64, armv6, armv7, aarch64, i386, powerpc, powerpc64, powerpc64le, powerpcspe, riscv64
+  help or --help               Print this message
+
+EOF
+	exit 1
+}
+
+check_apps() {
+	[ -z "$_GIT_BIN" ] && e_warn "git not found." && e_info_start "Installing git" && pkg install -q -y "$_GIT_PKG" && e_info_end && _GIT_BIN=$(command -v git)
+}
+
+download_aws_image() {
+	e_info_start "Checking if S3 bucket $_S3_BUCKET exists"
+	if ! "$_AWS_BIN" s3 ls "s3://$_S3_BUCKET" > /dev/null 2>&1; then
+		e_info_start "S3 bucket $_S3_BUCKET does not exist. Creating it"
+		if ! "$_AWS_BIN" s3 mb "s3://$_S3_BUCKET" ; then
+			e_die "Error: Failed to create S3 bucket $_S3_BUCKET."
+		fi
+		_BUCKET_CREATED=true
+		e_info_end
+	fi
+	e_info_end
+
+	e_info_start "Launching a small EC2 instance using AMI ID $_IMAGE_ID"
+	_INSTANCE_ID=$("$_AWS_BIN" ec2 run-instances --image-id "$_IMAGE_ID" --instance-type t3.micro --query 'Instances[0].InstanceId' --output text)
+
+	if [ -z "$_INSTANCE_ID" ]; then
+		e_die "Error: Failed to launch EC2 instance."
+	fi
+
+	e_info_start "EC2 instance launched with Instance ID: $_INSTANCE_ID. Waiting for the instance to be in 'running' state"
+	"$_AWS_BIN" ec2 wait instance-running --instance-ids "$_INSTANCE_ID"
+	sleep 60
+	e_info_end
+	e_info_end
+
+	e_info_start "Creating AMI from the instance"
+	_NEW_AMI_ID=$("$_AWS_BIN" ec2 create-image --instance-id "$_INSTANCE_ID" --name "ExportedAMI-$(date +%Y%m%d%H%M%S)" --no-reboot --query 'ImageId' --output text)
+	if [ -z "$_NEW_AMI_ID" ]; then
+		e_die "Error: Failed to create AMI from the instance."
+	fi
+	e_info_end
+
+	# Export the newly created AMI to the S3 bucket
+	e_info_start "Exporting AMI $_NEW_AMI_ID to S3 bucket $_S3_BUCKET"
+	_EXPORT_TASK_ID=$("$_AWS_BIN" ec2 export-image --image-id "$_NEW_AMI_ID" --disk-image-format raw --s3-export-location S3Bucket="$_S3_BUCKET",S3Prefix="exports/" --query 'ExportImageTaskId' --output text)
+
+	if [ -z "$_EXPORT_TASK_ID" ]; then
+		e_die "Error: Failed to initiate export task for AMI $_IMAGE_ID."
+	fi
+
+	e_info_start "Export task started with ID: $_EXPORT_TASK_ID. Waiting for completion"
+
+	# Wait for the export task to complete
+	while true; do
+		_EXPORT_STATUS=$("$_AWS_BIN" ec2 describe-export-image-tasks --export-image-task-ids "$_EXPORT_TASK_ID" --query 'ExportImageTasks[*].Status' --output text)
+		if [ "$_EXPORT_STATUS" = "completed" ]; then
+			info "Export task completed successfully."
+			_S3_OBJECT_KEY=$("$_AWS_BIN" ec2 describe-export-image-tasks --export-image-task-ids "$_EXPORT_TASK_ID" --query 'ExportImageTasks[*].S3ExportLocation.S3Key' --output text)
+			break
+		elif [ "$_EXPORT_STATUS" = "failed" ] || [ "$_EXPORT_STATUS" = "cancelled" ]; then
+			e_die "Error: Export task failed."
+		else
+			echo "Export task status: $_EXPORT_STATUS. Waiting"
+			sleep 10
+		fi
+	done
+
+	e_info_start "Downloading exported image from s3://$_S3_BUCKET/$_S3_OBJECT_KEY $_LOCAL_IMG_FILE_NAME "
+	if ! "$_AWS_BIN" s3 cp "s3://$_S3_BUCKET/$_S3_OBJECT_KEY" "$_LOCAL_IMG_FILE_NAME"; then
+		e_die "Error: Failed to download the image from S3."
+	fi
+	e_info_end
+
+	e_info_start "Deleting exported image from S3 bucket $_S3_BUCKET"
+	if ! "$_AWS_BIN" s3 rm "s3://$_S3_BUCKET/$_S3_OBJECT_KEY"; then
+		e_die "Error: Failed to delete the exported image from S3."
+	fi
+	e_info_end
+
+	if [ "$_BUCKET_CREATED" = true ]; then
+		e_info_start "Deleting S3 bucket $_S3_BUCKET"
+		if ! "$_AWS_BIN" s3 rb "s3://$_S3_BUCKET" --force; then
+			e_die "Error: Failed to delete the S3 bucket $_S3_BUCKET."
+		fi
+		e_info_end
+	fi
+	e_info_start "Deleting the newly created AMI $_NEW_AMI_ID"
+	if ! "$_AWS_BIN" ec2 deregister-image --image-id "$_NEW_AMI_ID"; then
+		e_die "Error: Failed to delete the AMI $_NEW_AMI_ID."
+	fi
+	exit 0
+}
+
+print_debugs() {
+	info "Machine Platform: ${_MACHINE_PLATFORM}"
+	info "Machine Architecture: ${_MACHINE_ARCH}"
+	info "Git branch: ${_GIT_BRANCH}"
+	info "Git hash: ${_GIT_HASH}"
+	info "GIT Repo Directory: ${_GIT_REPODIR}"
+	info "Image ID: ${_IMAGE_ID}"
+	info "Image Type: ${_IMAGE_TYPE}"
+	info "Local Image File: ${_LOCAL_IMG_FILE_NAME}"
+	info "Local Mount Point: ${_LOCAL_MOUNT_POINT}"
+}
+
+print_git_warning() {
+	e_warn "The git hash and branch may not be always available in the image description or kernel string."
+	e_warn "Please provide the git hash and branch manually."
+	e_warn "If you know the branch and hash, you can provide them using the -b and -g options."
+}
+
+read_image () {
+	# Create the md device
+	e_info_start "Creating md device"
+	_MD_DEV=$(mdconfig -a -t vnode -f "$_LOCAL_IMG_FILE_NAME")
+	if [ -z "$_MD_DEV" ]; then
+		e_die "Failed to create md device"
+	fi
+	e_info_end
+	# Check each partition for freebsd-ufs or freebsd-zfs
+	for _PART in $(gpart show "$_MD_DEV" | awk '/freebsd-ufs|freebsd-zfs/ {print $3}'); do
+		_FS_TYPE=$(gpart show "$_MD_DEV" | awk -v part="$_PART" '$3 == part {print $4}')
+
+		if [ "$_FS_TYPE" = "freebsd-ufs" ]; then
+			e_info_start "Mounting UFS partition $_PART"
+			if mount -t ufs /dev/"${_MD_DEV}"p"${_PART}" "$_LOCAL_MOUNT_POINT"; then
+				e_info_end
+			else
+				e_die "Failed to mount UFS partition"
+			fi
+		elif [ "$_FS_TYPE" = "freebsd-zfs" ]; then
+			e_info_start "Importing and mounting ZFS partition $_PART at $_LOCAL_MOUNT_POINT"
+			_ZROOT_NAME=$(zpool import -d /dev/ -o "$_LOCAL_MOUNT_POINT" | grep "pool:" | awk '{print $2}')
+			if [ -n "$_ZROOT_NAME" ]; then
+				if zpool import -R "$_LOCAL_MOUNT_POINT" "$_ZROOT_NAME" "$_ZROOTALT_NAME"; then
+					e_info_end
+				else
+					e_die "Failed to import and mount ZFS partition"
+				fi
+			else
+				e_die "No ZFS pool found"
+			fi
+		else
+			e_die "Unknown or unsupported filesystem type: $_FS_TYPE"
+		fi
+	done
+
+	# Get the kernel string
+	if [ -z "$_GIT_BRANCH" ] || [ -z "$_GIT_HASH" ]; then
+		_KERNEL_STRING=$("$_STRINGS_BIN" "$_LOCAL_MOUNT_POINT"/boot/kernel/kernel | grep -E "^FreeBSD.*(RELEASE|STABLE|MAIN).*(releng|stable|main).*GENERIC" | head -n 1)
+		if [ -z "$_KERNEL_STRING" ]; then
+			unmount_image
+			e_die "Kernel string not found. Please provide the git branch and hash manually."
+		else
+			if [ -z "$_GIT_BRANCH" ]; then
+				_GIT_BRANCH=$(echo "$_KERNEL_STRING" | grep -oE 'main|stable/[0-9]+|releng/[0-9]+\.[0-9]+|releng/[0-9]+' | head -n 1)
+				if [ -z "$_GIT_BRANCH" ]; then
+					unmount_image
+					e_die "Git branch could not be determined from the kernel string."
+				fi
+			fi
+			if [ -z "$_GIT_HASH" ]; then
+				_GIT_HASH=$(echo "$_KERNEL_STRING" | grep -oE '[0-9a-f]{12}' | head -n 1)
+				if [ -z "$_GIT_HASH" ]; then
+					unmount_image
+					e_die "Git hash could not be determined from the kernel string."
+				fi
+			fi
+		fi
+	fi
+
+	# Get the machine string
+	if [ -z "$_MACHINE_PLATFORM" ] || [ -z "$_MACHINE_ARCH" ]; then
+		# Extract the machine platform (amd64, arm, arm64, i386, powerpc, riscv)
+		_MACHINE_PLATFORM=$("$_STRINGS_BIN" "$_LOCAL_MOUNT_POINT"/boot/kernel/kernel | grep -oE '^machine.*(amd64|arm|arm64|i386|powerpc|riscv)' | awk '{print $NF}')
+		if [ -z "$_MACHINE_PLATFORM" ]; then
+			unmount_image
+			e_die "Machine platform could not be determined from the machine string."
+		elif [ "$_MACHINE_PLATFORM" = "amd64" ]; then
+			_MACHINE_ARCH="amd64"
+		elif [ "$_MACHINE_PLATFORM" = "arm" ]; then
+			_MACHINE_ARCH=$("$_STRINGS_BIN" "$_LOCAL_MOUNT_POINT"/boot/kernel/kernel | grep -oE '^(armv6|armv7)$')
+			if [ -z "$_MACHINE_ARCH" ]; then
+				unmount_image
+				e_die "Machine architecture could not be determined from the machine string."
+			fi
+		elif [ "$_MACHINE_PLATFORM" = "arm64" ]; then
+			_MACHINE_ARCH="aarch64"
+		elif [ "$_MACHINE_PLATFORM" = "i386" ]; then
+			_MACHINE_ARCH="i386"
+		elif [ "$_MACHINE_PLATFORM" = "powerpc" ]; then
+			_MACHINE_ARCH=$("$_STRINGS_BIN" "$_LOCAL_MOUNT_POINT"/boot/kernel/kernel | grep -oE '^(powerpc|powerpc64|powerpc64le|powerpcspe)$')
+			if [ -z "$_MACHINE_ARCH" ]; then
+				unmount_image
+				e_die "Machine architecture could not be determined from the machine string."
+			fi
+		elif [ "$_MACHINE_PLATFORM" = "riscv" ]; then
+			_MACHINE_ARCH=$("$_STRINGS_BIN" "$_LOCAL_MOUNT_POINT"/boot/kernel/kernel | grep -oE '^(riscv64|riscv64sf)$')
+			if [ -z "$_MACHINE_ARCH" ]; then
+				unmount_image
+				e_die "Machine architecture could not be determined from the machine string."
+			fi
+		fi
+	fi
+
+	calculate_hash "$_LOCAL_MOUNT_POINT" "$_HASH_IMAGE"
+	unmount_image
+}
+
+unmount_image() {
+	if [ "$_FS_TYPE" = "freebsd-ufs" ]; then
+		e_info_start "Unmounting UFS partition $_PART"
+		if umount -f "$_LOCAL_MOUNT_POINT"; then
+			e_info_end
+		else
+			e_die "Failed to unmount UFS partition"
+		fi
+	elif [ "$_FS_TYPE" = "freebsd-zfs" ]; then
+		e_info_start "Unmounting ZFS partition $_PART"
+		if zfs unmount -f "$_LOCAL_MOUNT_POINT"; then
+			e_info_end
+			e_info_start "Exporting ZFS partition $_PART"
+			if zpool export "$_ZROOTALT_NAME"; then
+				e_info_end
+			else
+				e_die "Failed to export ZFS partition"
+			fi
+		else
+			e_die "Failed to unmount ZFS partition"
+		fi
+	fi
+
+	# Destroy the md device
+	e_info_start "Destroying md device"
+	if mdconfig -d -u "$_MD_DEV"; then
+		e_info_end
+	else
+		e_die "Failed to destroy md device"
+	fi
+}
+
+calculate_hash() {
+	_LOCATION=$1
+	_OUTPUT_SPEC=$2
+	# Calculate the hash of the image
+	e_info_start "Calculating the hash of the image"
+	# Generate SHA256 digests for each file in the directory
+	find -s "$_LOCATION" -type f -exec sha256sum {} \+ | while read -r _sha256sum _filename; do
+		# Get the relative path of the file
+		_RELATIVE_PATH=${_filename#$_LOCATION}
+		# Write the file path and its SHA256 digest to the output spec file
+		echo "$_RELATIVE_PATH|$_sha256sum" >> "$_OUTPUT_SPEC"
+	done
+	e_info_end
+}
+
+clone_repo() {
+	e_info_start "Cloning the FreeBSD repository"
+	if ! "$_GIT_BIN" clone --branch "$_GIT_BRANCH" "$_GIT_URL" "$_GIT_REPODIR"; then
+		e_die "Failed to clone the FreeBSD repository"
+	fi
+	cd "$_GIT_REPODIR" && "$_GIT_BIN" checkout "$_GIT_HASH"
+	e_info_end
+}
+
+build_repo() {
+	e_info_start "Building the FreeBSD world "
+	if ! env MAKEOBJDIRPREFIX="$_OBJDIR" make -C "$_GIT_REPODIR" -j "$(sysctl -n hw.ncpu)" buildworld > /dev/null 2>&1; then
+		e_die "Failed to build the FreeBSD world"
+	fi
+	e_info_end
+	e_info_start "Building the FreeBSD kernel "
+	if ! env MAKEOBJDIRPREFIX="$_OBJDIR" make -C "$_GIT_REPODIR" -j "$(sysctl -n hw.ncpu)" buildkernel > /dev/null 2>&1; then
+		e_die "Failed to build the FreeBSD kernel"
+	fi
+	e_info_end
+	e_info_start "Building the FreeBSD vm image "
+	if ! env MAKEOBJDIRPREFIX="$_OBJDIR" make -C "$_GIT_REPODIR"/release -j "$(sysctl -n hw.ncpu)" vm-release WITH_VMIMAGES=yes VMFORMATS=raw NOPKG=yes NOPORTS=yes NOSRC=yes > /dev/null 2>&1; then
+		e_die "Failed to build the FreeBSD vm image"
+	fi
+	e_info_end
+}
+
+main() {
+	setup_cleanups
+	setup_traps trap_cleanups
+	check_apps
+
+	[ $# -lt 1 ] && usage
+
+	# Handle special-case commands first.
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-h|--hash)
+				# Parse the Git Hash and ensure it is a valid one.
+				if [ $# -eq 0 ]; then # No git hash was given, so show the command's help.
+					e_die "Git Hash not provided."
+				elif [ $# -gt 0 ]; then
+					if ! echo "$1" | grep -qE '^[0-9a-f]{7,40}$'; then
+						e_die "Invalid Git Hash"
+					else
+						_GIT_HASH=$1
+					fi
+				fi
+				;;
+			-b|--branch)
+				# Parse the Git Branch and ensure it is a valid one.
+				if [ $# -eq 0 ]; then # No git branch was given, so show the command's help.
+					e_die "Git Branch not provided."
+				elif [ $# -gt 0 ]; then
+					if ! echo "$1" | grep -qE '^(main|stable/[0-9]+|releng/[0-9]+\.[0-9]+|releng/[0-9]+)$'; then
+						e_die "Invalid Git Branch"
+					else
+						_GIT_BRANCH=$1
+					fi
+				fi
+				;;
+			-a|--arch)
+				# Parse the Machine Architecture and ensure it is a valid one.
+				if [ $# -eq 0 ]; then # No machine architecture was given, so show the command's help.
+					e_die "Machine Architecture not provided."
+				elif [ $# -gt 0 ]; then
+					case "${1}" in
+						amd64|arm|arm64|i386|powerpc|riscv)
+							_MACHINE_PLATFORM=$1
+							;;
+						*)
+							e_die "Invalid Machine Architecture"
+							;;
+					esac
+				fi
+				;;
+			-p|--platform)
+				# Parse the Machine Platform and ensure it is a valid one.
+				if [ $# -eq 0 ]; then # No machine platform was given, so show the command's help.
+					e_die "Machine Platform not provided."
+				elif [ $# -gt 0 ]; then
+					case "${1}" in
+						amd64|armv6|armv7|aarch64|i386|powerpc|powerpc64|powerpc64le|powerpcspe|riscv64)
+							_MACHINE_ARCH=$1
+							;;
+						*)
+							e_die "Invalid Machine Platform"
+							;;
+					esac
+				fi
+				;;
+			-t|--type)
+				shift
+				# Parse the image type and ensure it exists.
+				if [ $# -eq 0 ]; then # No image type was given, so show the command's help.
+					e_die "Image type not provided."
+				elif [ $# -gt 0 ]; then
+					_IMAGE_TYPE=$1
+					case "${_IMAGE_TYPE}" in
+						aws)
+							[ -z "$_AWS_BIN" ] && e_warn "aws not found." && e_info_start "Installing aws" && pkg install -q -y "$_AWS_PKG" && e_info_end && _AWS_BIN=$(command -v aws)
+							[ -z "$AWS_ACCESS_KEY_ID" ] && e_die "Error: AWS_ACCESS_KEY_ID environment variable is not set."
+							[ -z "$AWS_SECRET_ACCESS_KEY" ] && e_die "Error: AWS_SECRET_ACCESS_KEY environment variable is not set."
+							[ -z "$AWS_DEFAULT_REGION" ] && [ -z "$AWS_REGION" ] && e_die "Error: AWS_DEFAULT_REGION or AWS_REGION environment variable is not set."
+							info "Your image type is: ${_IMAGE_TYPE}"
+							;;
+						local)
+							info "Your image type is: ${_IMAGE_TYPE}"
+							;;
+						remote)
+							info "Your image type is: ${_IMAGE_TYPE}"
+							;;
+						*)
+							e_die "Image type can be either local which is for a local file or an aws AMI image"
+							;;
+					esac
+				fi
+				;;
+			-i|--image)
+				shift
+				# Parse the image ID and ensure it exists.
+				if [ $# -eq 0 ]; then # No image ID was given, so show the command's help.
+					e_die "Image ID not provided."
+				elif [ $# -eq 1 ]; then
+					_IMAGE_ID=${1}
+					info "Your image ID is: ${_IMAGE_ID}"
+					_VALID_IMAGE=$("$_AWS_BIN" ec2 describe-images --image-ids "$_IMAGE_ID" --query 'Images[*].[Description]' --output text 2>/dev/null)
+					if [ "$_IMAGE_TYPE" = "aws" ]; then
+						if [ -z "$_VALID_IMAGE" ]; then
+							e_die "Error: The Image ID $_IMAGE_ID is invalid or does not exist in the specified region."
+						else
+							# Extract the machine architecture, git branch, and git hash from the description
+							_MACHINE_PLATFORM=$(echo "$_VALID_IMAGE" | awk -F' ' '{print $1}' | awk -F'/' '{print $2}')
+							_GIT_BRANCH=$(echo "$_VALID_IMAGE" | awk -F' ' '{print $2}' | awk -F'@' '{print $1}')
+							_GIT_HASH=$(echo "$_VALID_IMAGE" | awk -F'@' '{print $2}')
+							if [ "$_MACHINE_PLATFORM" = "amd64" ]; then
+								_MACHINE_ARCH="amd64"
+							elif [ "$_MACHINE_PLATFORM" = "arm64" ]; then
+								_MACHINE_ARCH="aarch64"
+							fi
+							info "Machine Platform: ${_MACHINE_PLATFORM}"
+							info "Machine Architecture: ${_MACHINE_ARCH}"
+							info "Git branch: ${_GIT_BRANCH}"
+							info "Git hash: ${_GIT_HASH}"
+							if [ -z "$_GIT_BRANCH" ] || [ -z "$_GIT_HASH" ]; then
+								print_git_warning
+							fi
+							download_aws_image
+						fi
+					elif [ "$_IMAGE_TYPE" = "local" ]; then
+						if [ ! -f "$_IMAGE_ID" ]; then
+							e_die "Error: The local image path $_IMAGE_ID does not exist."
+						else
+							case "$_IMAGE_ID" in
+								*qcow2*|*.vhd*|*vmdk*)
+									e_die "Invalid image format. Only raw images are supported."
+									;;
+								*.xz)
+									info "Local image path: ${_IMAGE_ID}"
+									e_info_start "Extracting the local image to $_LOCAL_IMG_FILE_NAME"
+									xz -d -c "$_IMAGE_ID" > "$_LOCAL_IMG_FILE_NAME"
+									e_info_end
+									;;
+								*.raw)
+									info "Local image path: ${_IMAGE_ID}"
+									e_info_start "Copying the local image to $_LOCAL_IMG_FILE_NAME"
+									cp -f "$_IMAGE_ID" "$_LOCAL_IMG_FILE_NAME"
+									e_info_end
+									;;
+							esac
+						fi
+					elif [ "$_IMAGE_TYPE" = "remote" ]; then
+						if [ -z "$_IMAGE_ID" ]; then
+							e_die "Error: No URL provided."
+						else
+							case "$_IMAGE_ID" in
+								ftp://*.xz$|http://*.xz$|https://*.xz)
+									e_info_start "Downloading the remote image to $_LOCAL_COMPRESSED_FILE_NAME"
+									download "$_IMAGE_ID" "$_LOCAL_COMPRESSED_FILE_NAME"
+									e_info_end
+									e_info_start "Extracting the remote image to $_LOCAL_IMG_FILE_NAME"
+									xz -d -c "$_LOCAL_COMPRESSED_FILE_NAME" > "$_LOCAL_IMG_FILE_NAME"
+									e_info_end
+									;;
+								ftp://*.raw$|http://*.raw$|https://*.raw)
+									e_info_start "Downloading the remote image to $_LOCAL_IMG_FILE_NAME"
+									download "$_IMAGE_ID" "$_LOCAL_IMG_FILE_NAME"
+									e_info_end
+									;;
+								*qcow2*|*.vhd*|*vmdk*)
+									e_die "Invalid image format. Only raw images are supported."
+									;;
+								*)
+									e_die "Invalid URL. Must start with ftp://, http://, or https://"
+									;;
+							esac
+						fi
+					fi
+				fi
+				;;
+			--help|help)
+				usage
+				;;
+			*)  # Filter out all non-commands
+				e_warn "Illegal option ${CMD}"
+				usage
+				;;
+		esac
+		shift
+	done
+	read_image
+	clone_repo
+	build_repo
+	calculate_hash "$_OBJDIR"/"$_GIT_REPODIR"/"$_MACHINE_PLATFORM"."$_MACHINE_ARCH"/release/vm-image-raw-ufs "$_HASH_OBJDIR"
+	chflags -R noschg "$_OBJDIR"
+	if [ ! -d "$_RESULT_DIR" ]; then
+		$_MKDIR "$_RESULT_DIR"
+	fi
+	cp "$_HASH_OBJDIR" "$_RESULT_DIR"/"$TODAY"-"$_MACHINE_PLATFORM"-"$_MACHINE_ARCH"-"$_GIT_HASH"-obj.sha256
+	cp "$_HASH_IMAGE" "$_RESULT_DIR"/"$TODAY"-"$_MACHINE_PLATFORM"-"$_MACHINE_ARCH"-"$_GIT_HASH"-image.sha256
+	diff -u "$_HASH_OBJDIR" "$_HASH_IMAGE" > "$_RESULT_DIR"/"$TODAY"-"$_MACHINE_PLATFORM"-"$_MACHINE_ARCH"-"$_GIT_HASH".diff
+	print_debugs
+}
+
+main "$@"
+
+# vim: ft=sh
